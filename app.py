@@ -1,12 +1,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from datetime import date, datetime
 from io import BytesIO
 import html
+import re
+import bcrypt
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 import streamlit.components.v1 as components
 from streamlit_sortables import sort_items
 
@@ -22,9 +26,152 @@ st.set_page_config(
     layout="wide",
 )
 
+AUTH_USER_KEY = "authenticated_user"
+AUTH_ROLE_KEY = "user_role"
+VALID_ROLES = {"editor", "visualizador"}
+LOGIN_OPTIONS = {"Editor": "editor", "Visualizador": "visualizador"}
+BCRYPT_HASH_PATTERN = re.compile(
+    r"\$2[aby]\$(?:0[4-9]|[12][0-9]|3[01])\$[./A-Za-z0-9]{53}\Z"
+)
+
+
+def _authenticate_user() -> None:
+    selected_user = st.session_state.get("login_username")
+    username = LOGIN_OPTIONS.get(selected_user)
+    password = st.session_state.get("login_password", "")
+    try:
+        accounts = st.secrets.get("usuarios")
+    except StreamlitSecretNotFoundError:
+        accounts = None
+
+    st.session_state.pop(AUTH_USER_KEY, None)
+    st.session_state.pop(AUTH_ROLE_KEY, None)
+    st.session_state.pop("login_error", None)
+
+    if username is None or not isinstance(accounts, Mapping):
+        st.session_state["login_error"] = "configuration"
+    else:
+        account = accounts.get(username)
+
+        if not isinstance(account, Mapping):
+            st.session_state["login_error"] = "configuration"
+        else:
+            password_hash = account.get("password_hash")
+            role = account.get("rol")
+
+            if (
+                not isinstance(password_hash, str)
+                or not BCRYPT_HASH_PATTERN.fullmatch(password_hash)
+                or not isinstance(role, str)
+                or role != username
+            ):
+                st.session_state["login_error"] = "configuration"
+            elif not isinstance(password, str):
+                st.session_state["login_error"] = "invalid"
+            else:
+                password_bytes = password.encode("utf-8")
+                try:
+                    if len(password_bytes) > 72:
+                        valid_credentials = False
+                    else:
+                        valid_credentials = bcrypt.checkpw(
+                            password_bytes,
+                            password_hash.encode("utf-8"),
+                        )
+                except ValueError:
+                    st.session_state["login_error"] = "configuration"
+                else:
+                    if valid_credentials:
+                        st.session_state[AUTH_USER_KEY] = username
+                        st.session_state[AUTH_ROLE_KEY] = role
+                    else:
+                        st.session_state["login_error"] = "invalid"
+
+    st.session_state.pop("login_password", None)
+
+
+def _logout_user() -> None:
+    st.session_state.pop(AUTH_USER_KEY, None)
+    st.session_state.pop(AUTH_ROLE_KEY, None)
+    st.session_state.pop("login_error", None)
+    st.session_state.pop("login_password", None)
+    st.session_state.pop("login_username", None)
+
+
+def require_editor() -> None:
+    if st.session_state.get(AUTH_ROLE_KEY) != "editor":
+        st.error("Esta operación requiere el rol editor.")
+        st.stop()
+
+
+if (
+    st.session_state.get(AUTH_USER_KEY) is None
+    or st.session_state.get(AUTH_ROLE_KEY) not in VALID_ROLES
+):
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stForm"] {
+            padding: 1.25rem;
+            border: 1px solid #DCE5E1;
+            border-radius: 14px;
+            background: #FFFFFF;
+            box-shadow: 0 12px 32px rgba(15, 55, 42, .08);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    _, login_column, _ = st.columns([1, 1.4, 1])
+
+    with login_column:
+        st.image(str(LOGO_PATH), width=150)
+        st.title("Almacén Digital — COONAPROSAL R.L.")
+        st.caption("Ingrese sus credenciales para consultar el almacén.")
+
+        with st.form("login_form", clear_on_submit=True):
+            st.selectbox(
+                "Usuario",
+                list(LOGIN_OPTIONS),
+                key="login_username",
+            )
+            st.text_input(
+                "Contraseña",
+                type="password",
+                key="login_password",
+            )
+            st.form_submit_button(
+                "Iniciar sesión",
+                type="primary",
+                use_container_width=True,
+                on_click=_authenticate_user,
+            )
+
+        login_error = st.session_state.get("login_error")
+        if login_error == "invalid":
+            st.error("Usuario o contraseña incorrectos.")
+        elif login_error == "configuration":
+            st.error(
+                "No se pudo validar la configuración de autenticación. "
+                "Verifique los secretos de la aplicación."
+            )
+
+    st.stop()
+
+current_user = st.session_state[AUTH_USER_KEY]
+current_role = st.session_state[AUTH_ROLE_KEY]
+is_editor = current_role == "editor"
+
+with st.sidebar:
+    st.caption(f"Sesión: **{current_user}**")
+    st.caption(f"Rol: **{current_role.upper()}**")
+    st.button(
+        "Cerrar sesión",
+        on_click=_logout_user,
+        use_container_width=True,
+    )
 
 DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
 
 STATE_FILE = DATA_DIR / "warehouse_state_v7.csv"
 MOVES_FILE = DATA_DIR / "movements_v7.csv"
@@ -151,6 +298,7 @@ DEFAULT_CATALOG = [{'sku': '0007', 'product': 'Sal Solar 500g C/F 1x25 unid', 'c
 
 
 def save_catalog(catalog: pd.DataFrame) -> None:
+    require_editor()
     catalog = catalog.copy()
 
     for col in CATALOG_COLUMNS:
@@ -177,6 +325,7 @@ def save_catalog(catalog: pd.DataFrame) -> None:
         keep="last",
     )
 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     catalog[CATALOG_COLUMNS].to_csv(
         CATALOG_FILE,
         index=False,
@@ -186,11 +335,9 @@ def save_catalog(catalog: pd.DataFrame) -> None:
 
 def load_catalog() -> pd.DataFrame:
     if not CATALOG_FILE.exists():
-        save_catalog(
-            pd.DataFrame(
-                DEFAULT_CATALOG,
-                columns=CATALOG_COLUMNS,
-            )
+        return pd.DataFrame(
+            DEFAULT_CATALOG,
+            columns=CATALOG_COLUMNS,
         )
 
     catalog = pd.read_csv(
@@ -236,6 +383,7 @@ def upsert_product(
     unit: str = "Bultos",
     suggested_zone: str = "Sin asignación fija",
 ) -> pd.DataFrame:
+    require_editor()
     sku_clean = str(sku).strip().upper()
     product_clean = str(product).strip()
 
@@ -586,14 +734,14 @@ def create_empty_state() -> pd.DataFrame:
 
 
 def save_state(df: pd.DataFrame) -> None:
+    require_editor()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(STATE_FILE, index=False, encoding="utf-8-sig")
 
 
 def load_state() -> pd.DataFrame:
     if not STATE_FILE.exists():
-        df = create_empty_state()
-        save_state(df)
-        return df
+        return create_empty_state()
 
     df = pd.read_csv(STATE_FILE, dtype=str).fillna("")
 
@@ -624,12 +772,14 @@ def load_state() -> pd.DataFrame:
 
 
 def save_moves(df: pd.DataFrame) -> None:
+    require_editor()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(MOVES_FILE, index=False, encoding="utf-8-sig")
 
 
 def load_moves() -> pd.DataFrame:
     if not MOVES_FILE.exists():
-        save_moves(pd.DataFrame(columns=MOVE_COLUMNS))
+        return pd.DataFrame(columns=MOVE_COLUMNS)
 
     df = pd.read_csv(MOVES_FILE, dtype=str).fillna("")
 
@@ -641,6 +791,7 @@ def load_moves() -> pd.DataFrame:
 
 
 def log_move(**kwargs) -> None:
+    require_editor()
     moves = load_moves()
 
     row = {
@@ -675,6 +826,7 @@ def occupy_slot(
     entry_shift: str,
     bundles: int,
 ) -> None:
+    require_editor()
     df.at[idx, "sku"] = sku.strip()
     df.at[idx, "product"] = product.strip()
     df.at[idx, "lot"] = lot.strip()
@@ -686,6 +838,7 @@ def occupy_slot(
 
 
 def clear_slot(df: pd.DataFrame, idx: int) -> None:
+    require_editor()
     for col in [
         "sku",
         "product",
@@ -3037,6 +3190,9 @@ if search:
 st.divider()
 st.subheader("Operación")
 
+if not is_editor:
+    st.info("Modo de solo lectura: las operaciones de almacén están deshabilitadas.")
+
 tab_in, tab_out, tab_relocate, tab_peps = st.tabs(
     [
         "Entrada",
@@ -3246,7 +3402,8 @@ with tab_in:
             )
 
         generate_plan = st.form_submit_button(
-            "Generar propuesta de ubicaciones"
+            "Generar propuesta de ubicaciones",
+            disabled=not is_editor,
         )
 
     if generate_plan:
@@ -3442,7 +3599,7 @@ with tab_in:
             if st.button(
                 f"Registrar {batch_plan['quantity']} tarima(s)",
                 type="primary",
-                disabled=not confirm_batch_entry,
+                disabled=not confirm_batch_entry or not is_editor,
                 key="register_batch_entry",
             ):
                 successful = 0
@@ -3962,6 +4119,7 @@ with tab_out:
                     not correct_quantity
                     or not access_ready
                     or not confirm_dispatch
+                    or not is_editor
                 ),
                 key="register_batch_out",
             ):
@@ -4364,7 +4522,7 @@ with tab_relocate:
                             if st.button(
                                 "Aplicar movimiento",
                                 type="primary",
-                                disabled=not confirm_drag,
+                                disabled=not confirm_drag or not is_editor,
                                 key="apply_drag_relocation",
                             ):
                                 moved_count = 0
@@ -4545,6 +4703,7 @@ with tab_relocate:
                         disabled=(
                             not selected_labels
                             or not confirm_multi
+                            or not is_editor
                         ),
                         key="relocate_selected_pallets",
                     ):
@@ -5005,7 +5164,7 @@ else:
         with delete_col:
             if st.button(
                 "Borrar solo esta línea",
-                disabled=not confirm_single,
+                disabled=not confirm_single or not is_editor,
                 key="delete_history_line",
             ):
                 updated_moves = (
@@ -5043,6 +5202,7 @@ else:
                 "Anular entrada y quitar tarima",
                 disabled=(
                     not confirm_single
+                    or not is_editor
                     or not is_entry
                     or not str(
                         selected_move[
@@ -5176,11 +5336,13 @@ catalog_editor = st.data_editor(
     use_container_width=True,
     hide_index=True,
     num_rows="dynamic",
+    disabled=not is_editor,
     key="catalog_editor",
 )
 
 if st.button(
     "Guardar catálogo de productos",
+    disabled=not is_editor,
     key="save_catalog_button",
 ):
     save_catalog(
@@ -5219,7 +5381,7 @@ with a1:
 
     if st.button(
         "Borrar historial",
-        disabled=not confirm_history,
+        disabled=not confirm_history or not is_editor,
     ):
         save_moves(pd.DataFrame(columns=MOVE_COLUMNS))
         st.success("Historial borrado.")
@@ -5239,7 +5401,7 @@ with a2:
 
     if st.button(
         "Reiniciar todo",
-        disabled=not confirm_reset,
+        disabled=not confirm_reset or not is_editor,
     ):
         save_state(create_empty_state())
         save_moves(pd.DataFrame(columns=MOVE_COLUMNS))
