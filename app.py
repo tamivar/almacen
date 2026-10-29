@@ -2382,7 +2382,7 @@ df = load_state()
 catalog = load_catalog()
 moves = load_moves()
 
-st.image(str(LOGO_PATH), width=160)
+st.image(str(LOGO_PATH), width="stretch")
 
 st.title("Almacén Digital — COONAPROSAL R.L.")
 
