@@ -22,6 +22,7 @@ st.set_page_config(
     layout="wide",
 )
 
+
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
