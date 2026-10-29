@@ -10,7 +10,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_sortables import sort_items
 
-LOGO_PATH = Path(__file__).resolve().parent / "img" / "salsol.jpg"
+LOGO_PATH = Path(__file__).resolve().parent / "img" / "salsol.png"
 
 # ============================================================
 # CONFIGURACIÓN
