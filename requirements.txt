@@ -1,0 +1,6 @@
+streamlit>=1.39
+pandas>=2.0
+
+xlsxwriter>=3.2
+
+streamlit-sortables>=0.3.1
