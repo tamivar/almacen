@@ -123,6 +123,17 @@ ni el archivo local de secretos.
 
 `visualizador` = solo lectura. `editor` = puede operar y guardar.
 
+**Sesión recordada (cookie).** Al iniciar sesión se guarda una cookie
+firmada con `cookie_key` que mantiene la sesión 8 horas, aunque se recargue
+la página. Reglas:
+
+- Si el usuario escribe una contraseña, manda el resultado de esa contraseña;
+  la cookie nunca la reemplaza.
+- "Cerrar sesión" invalida y borra la cookie, y esa pestaña vuelve a pedir
+  contraseña.
+- Para cerrar **todas** las sesiones abiertas, cambie `cookie_key` (en el
+  archivo local y en los Secrets de Cloud).
+
 ## Persistencia en Streamlit Community Cloud
 
 Los datos se guardan en los CSV de `data/`. En Streamlit Community Cloud el
