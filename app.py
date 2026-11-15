@@ -3,11 +3,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
+import hashlib
+import hmac
 import html
+import logging
 import re
+import time
 import bcrypt
+import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
@@ -29,73 +34,228 @@ st.set_page_config(
 AUTH_USER_KEY = "authenticated_user"
 AUTH_ROLE_KEY = "user_role"
 VALID_ROLES = {"editor", "visualizador"}
-LOGIN_OPTIONS = {"Editor": "editor", "Visualizador": "visualizador"}
 BCRYPT_HASH_PATTERN = re.compile(
     r"\$2[aby]\$(?:0[4-9]|[12][0-9]|3[01])\$[./A-Za-z0-9]{53}\Z"
 )
+AUTH_DIAGNOSTIC_KEY = "login_diagnostic"
+PENDING_AUTH_USER_KEY = "pending_authenticated_user"
+PENDING_AUTH_ROLE_KEY = "pending_user_role"
+AUTH_COOKIE_NAME = "almacen_auth"
+AUTH_COOKIE_TTL = timedelta(hours=8)
+AUTH_SESSION_EXPIRATION_KEY = "auth_session_expiration"
+AUTH_COOKIE_PENDING_KEY = "auth_cookie_pending"
+COOKIE_MANAGER_READY_KEY = "auth_cookie_manager_ready"
+COOKIE_LOGOUT_PENDING_KEY = "auth_cookie_logout_pending"
+COOKIE_CONFIGURATION_KEY = "auth_cookie_configuration_error"
+logger = logging.getLogger(__name__)
+
+
+def _cookie_signing_key() -> bytes:
+    try:
+        key = st.secrets.get("cookie_key")
+    except StreamlitSecretNotFoundError as exc:
+        raise ValueError("st.secrets['cookie_key']") from exc
+
+    if not isinstance(key, str) or len(key.encode("utf-8")) < 32:
+        raise ValueError("st.secrets['cookie_key'] (mínimo 32 bytes)")
+
+    return key.encode("utf-8")
+
+
+def _set_auth_cookie(username: str) -> None:
+    expires_at = datetime.now(timezone.utc) + AUTH_COOKIE_TTL
+    expires_timestamp = int(expires_at.timestamp())
+    st.session_state[AUTH_SESSION_EXPIRATION_KEY] = expires_timestamp
+
+    try:
+        signing_key = _cookie_signing_key()
+    except ValueError as exc:
+        st.session_state[COOKIE_CONFIGURATION_KEY] = str(exc)
+        logger.warning("Persistent authentication cookie unavailable: %s", exc)
+        return
+
+    payload = f"v1:{username}:{expires_timestamp}"
+    signature = hmac.new(
+        signing_key,
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    st.session_state[AUTH_COOKIE_PENDING_KEY] = (
+        f"{payload}:{signature}",
+        expires_at,
+    )
+    st.session_state.pop(COOKIE_CONFIGURATION_KEY, None)
+
+
+def _restore_authentication_from_cookie(cookie_value: object) -> bool:
+    if not isinstance(cookie_value, str):
+        return False
+
+    try:
+        version, username, expiration_text, signature = cookie_value.split(":", 3)
+        expires_timestamp = int(expiration_text)
+    except ValueError:
+        return False
+
+    if version != "v1" or username not in VALID_ROLES:
+        return False
+    if expires_timestamp <= int(time.time()):
+        return False
+
+    try:
+        signing_key = _cookie_signing_key()
+    except ValueError as exc:
+        st.session_state[COOKIE_CONFIGURATION_KEY] = str(exc)
+        logger.warning("Persistent authentication cookie unavailable: %s", exc)
+        return False
+
+    payload = f"{version}:{username}:{expires_timestamp}"
+    expected_signature = hmac.new(
+        signing_key,
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return False
+
+    st.session_state[AUTH_USER_KEY] = username
+    st.session_state[AUTH_ROLE_KEY] = username
+    st.session_state[AUTH_SESSION_EXPIRATION_KEY] = expires_timestamp
+    st.session_state.pop(COOKIE_CONFIGURATION_KEY, None)
+    return True
+
+
+def _set_auth_configuration_error(
+    location: str,
+    error: Exception | None = None,
+) -> None:
+    diagnostic = location
+    if error is not None:
+        exception_type = type(error).__name__
+        diagnostic = f"{location} ({exception_type})"
+        logger.warning(
+            "Authentication configuration error at %s (%s)",
+            location,
+            exception_type,
+        )
+    st.session_state["login_error"] = "configuration"
+    st.session_state[AUTH_DIAGNOSTIC_KEY] = diagnostic
 
 
 def _authenticate_user() -> None:
-    selected_user = st.session_state.get("login_username")
-    username = LOGIN_OPTIONS.get(selected_user)
     password = st.session_state.get("login_password", "")
+    st.session_state.pop(PENDING_AUTH_USER_KEY, None)
+    st.session_state.pop(PENDING_AUTH_ROLE_KEY, None)
+    st.session_state.pop("login_error", None)
+    st.session_state.pop(AUTH_DIAGNOSTIC_KEY, None)
+
     try:
         accounts = st.secrets.get("usuarios")
-    except StreamlitSecretNotFoundError:
-        accounts = None
-
-    st.session_state.pop(AUTH_USER_KEY, None)
-    st.session_state.pop(AUTH_ROLE_KEY, None)
-    st.session_state.pop("login_error", None)
-
-    if username is None or not isinstance(accounts, Mapping):
-        st.session_state["login_error"] = "configuration"
+    except StreamlitSecretNotFoundError as exc:
+        _set_auth_configuration_error("st.secrets['usuarios']", exc)
     else:
-        account = accounts.get(username)
-
-        if not isinstance(account, Mapping):
-            st.session_state["login_error"] = "configuration"
+        if not isinstance(accounts, Mapping):
+            _set_auth_configuration_error(
+                "st.secrets['usuarios'] (estructura inválida)"
+            )
+        elif not isinstance(password, str):
+            st.session_state["login_error"] = "invalid"
         else:
-            password_hash = account.get("password_hash")
-            role = account.get("rol")
-
-            if (
-                not isinstance(password_hash, str)
-                or not BCRYPT_HASH_PATTERN.fullmatch(password_hash)
-                or not isinstance(role, str)
-                or role != username
-            ):
-                st.session_state["login_error"] = "configuration"
-            elif not isinstance(password, str):
-                st.session_state["login_error"] = "invalid"
-            else:
+            try:
                 password_bytes = password.encode("utf-8")
-                try:
-                    if len(password_bytes) > 72:
-                        valid_credentials = False
-                    else:
-                        valid_credentials = bcrypt.checkpw(
-                            password_bytes,
-                            password_hash.encode("utf-8"),
-                        )
-                except ValueError:
-                    st.session_state["login_error"] = "configuration"
+            except UnicodeEncodeError as exc:
+                _set_auth_configuration_error("codificación de contraseña", exc)
+            else:
+                matches: list[tuple[str, str]] = []
+                configuration_error: str | None = None
+                if len(password_bytes) <= 72:
+                    for username, account in accounts.items():
+                        if not isinstance(username, str) or username not in VALID_ROLES:
+                            configuration_error = (
+                                "st.secrets['usuarios'] (usuario inválido)"
+                            )
+                            break
+                        if not isinstance(account, Mapping):
+                            configuration_error = (
+                                f"st.secrets['usuarios']['{username}']"
+                            )
+                            break
+
+                        password_hash = account.get("password_hash")
+                        role = account.get("rol")
+                        if (
+                            not isinstance(password_hash, str)
+                            or not BCRYPT_HASH_PATTERN.fullmatch(password_hash)
+                        ):
+                            configuration_error = (
+                                "st.secrets['usuarios']"
+                                f"['{username}']['password_hash'] (formato bcrypt)"
+                            )
+                            break
+                        if not isinstance(role, str) or role != username:
+                            configuration_error = (
+                                f"st.secrets['usuarios']['{username}']['rol']"
+                            )
+                            break
+
+                        try:
+                            if bcrypt.checkpw(
+                                password_bytes,
+                                password_hash.encode("utf-8"),
+                            ):
+                                matches.append((username, role))
+                        except (ValueError, TypeError) as exc:
+                            _set_auth_configuration_error(
+                                "bcrypt.checkpw", exc
+                            )
+                            configuration_error = "bcrypt.checkpw"
+                            break
+
+                if configuration_error is not None:
+                    if configuration_error != "bcrypt.checkpw":
+                        _set_auth_configuration_error(configuration_error)
+                elif len(matches) > 1:
+                    _set_auth_configuration_error(
+                        "st.secrets['usuarios'] (contraseña asignada a más de un rol)"
+                    )
+                elif len(matches) == 1:
+                    username, role = matches[0]
+                    st.session_state[PENDING_AUTH_USER_KEY] = username
+                    st.session_state[PENDING_AUTH_ROLE_KEY] = role
                 else:
-                    if valid_credentials:
-                        st.session_state[AUTH_USER_KEY] = username
-                        st.session_state[AUTH_ROLE_KEY] = role
-                    else:
-                        st.session_state["login_error"] = "invalid"
+                    st.session_state["login_error"] = "invalid"
 
     st.session_state.pop("login_password", None)
 
 
-def _logout_user() -> None:
-    st.session_state.pop(AUTH_USER_KEY, None)
-    st.session_state.pop(AUTH_ROLE_KEY, None)
+def _confirm_login() -> None:
+    username = st.session_state.get(PENDING_AUTH_USER_KEY)
+    role = st.session_state.get(PENDING_AUTH_ROLE_KEY)
+    if (
+        not isinstance(username, str)
+        or username not in VALID_ROLES
+        or role != username
+    ):
+        _set_auth_configuration_error("sesión pendiente (usuario o rol inválido)")
+        st.session_state.pop(PENDING_AUTH_USER_KEY, None)
+        st.session_state.pop(PENDING_AUTH_ROLE_KEY, None)
+        return
+
+    st.session_state[AUTH_USER_KEY] = username
+    st.session_state[AUTH_ROLE_KEY] = role
+    st.session_state.pop(PENDING_AUTH_USER_KEY, None)
+    st.session_state.pop(PENDING_AUTH_ROLE_KEY, None)
     st.session_state.pop("login_error", None)
-    st.session_state.pop("login_password", None)
-    st.session_state.pop("login_username", None)
+    st.session_state.pop(AUTH_DIAGNOSTIC_KEY, None)
+    _set_auth_cookie(username)
+
+
+def _logout_user(cookie_manager: stx.CookieManager) -> None:
+    if cookie_manager.get(AUTH_COOKIE_NAME) is not None:
+        cookie_manager.delete(AUTH_COOKIE_NAME)
+    st.session_state.clear()
+    st.session_state[COOKIE_MANAGER_READY_KEY] = True
+    st.session_state[COOKIE_LOGOUT_PENDING_KEY] = True
 
 
 def require_editor() -> None:
@@ -103,6 +263,44 @@ def require_editor() -> None:
         st.error("Esta operación requiere el rol editor.")
         st.stop()
 
+
+cookie_manager = stx.CookieManager(key="auth_cookie_manager")
+if not st.session_state.get(COOKIE_MANAGER_READY_KEY):
+    st.session_state[COOKIE_MANAGER_READY_KEY] = True
+    st.stop()
+
+pending_auth_cookie = st.session_state.pop(AUTH_COOKIE_PENDING_KEY, None)
+if pending_auth_cookie is not None:
+    cookie_value, cookie_expiration = pending_auth_cookie
+    cookie_manager.set(
+        AUTH_COOKIE_NAME,
+        cookie_value,
+        expires_at=cookie_expiration,
+    )
+
+if st.session_state.get(AUTH_USER_KEY) is not None:
+    session_expiration = st.session_state.get(AUTH_SESSION_EXPIRATION_KEY)
+    if (
+        not isinstance(session_expiration, int)
+        or session_expiration <= int(time.time())
+    ):
+        _logout_user(cookie_manager)
+
+if st.session_state.get(COOKIE_LOGOUT_PENDING_KEY):
+    if cookie_manager.get(AUTH_COOKIE_NAME) is not None:
+        cookie_manager.delete(AUTH_COOKIE_NAME)
+        st.stop()
+    st.session_state.pop(COOKIE_LOGOUT_PENDING_KEY, None)
+
+if (
+    st.session_state.get(AUTH_USER_KEY) is None
+    or st.session_state.get(AUTH_ROLE_KEY) not in VALID_ROLES
+):
+    auth_cookie = cookie_manager.get(AUTH_COOKIE_NAME)
+    if auth_cookie is not None and not _restore_authentication_from_cookie(
+        auth_cookie
+    ):
+        cookie_manager.delete(AUTH_COOKIE_NAME)
 
 if (
     st.session_state.get(AUTH_USER_KEY) is None
@@ -128,33 +326,51 @@ if (
         st.image(str(LOGO_PATH), width=150)
         st.title("Almacén Digital — COONAPROSAL R.L.")
         st.caption("Ingrese sus credenciales para consultar el almacén.")
+        if st.session_state.get(COOKIE_CONFIGURATION_KEY):
+            st.warning(
+                "La sesión persistente no está configurada. Revise "
+                "st.secrets['cookie_key'] (mínimo 32 bytes)."
+            )
 
-        with st.form("login_form", clear_on_submit=True):
-            st.selectbox(
-                "Usuario",
-                list(LOGIN_OPTIONS),
-                key="login_username",
-            )
-            st.text_input(
-                "Contraseña",
-                type="password",
-                key="login_password",
-            )
-            st.form_submit_button(
-                "Iniciar sesión",
+        pending_username = st.session_state.get(PENDING_AUTH_USER_KEY)
+        pending_role = st.session_state.get(PENDING_AUTH_ROLE_KEY)
+        if pending_username in VALID_ROLES and pending_role == pending_username:
+            role_label = "Editor" if pending_role == "editor" else "Visualizador"
+            st.success(f"Contraseña correcta. Rol asignado: {role_label}")
+            st.button(
+                "Entrar",
                 type="primary",
                 use_container_width=True,
-                on_click=_authenticate_user,
+                on_click=_confirm_login,
             )
+        else:
+            with st.form("login_form", clear_on_submit=True):
+                st.text_input(
+                    "Contraseña",
+                    type="password",
+                    key="login_password",
+                )
+                st.form_submit_button(
+                    "Iniciar sesión",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_authenticate_user,
+                )
 
         login_error = st.session_state.get("login_error")
         if login_error == "invalid":
-            st.error("Usuario o contraseña incorrectos.")
+            st.error(
+                "Su contraseña no está asignada a ningún rol. "
+                "Verifique e intente de nuevo."
+            )
         elif login_error == "configuration":
             st.error(
                 "No se pudo validar la configuración de autenticación. "
                 "Verifique los secretos de la aplicación."
             )
+            diagnostic = st.session_state.get(AUTH_DIAGNOSTIC_KEY)
+            if diagnostic:
+                st.caption(f"Diagnóstico seguro: {diagnostic}")
 
     st.stop()
 
@@ -164,12 +380,19 @@ is_editor = current_role == "editor"
 
 with st.sidebar:
     st.caption(f"Sesión: **{current_user}**")
-    st.caption(f"Rol: **{current_role.upper()}**")
-    st.button(
-        "Cerrar sesión",
-        on_click=_logout_user,
-        use_container_width=True,
-    )
+    role_label = "Editor" if current_role == "editor" else "Visualizador"
+    st.caption(f"Ingresó como: **{role_label}**")
+    if st.session_state.get(COOKIE_CONFIGURATION_KEY):
+        st.warning(
+            "La sesión persistente no está configurada. Revise "
+            "st.secrets['cookie_key'] (mínimo 32 bytes)."
+        )
+    if st.button("Actualizar datos", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    if st.button("Cerrar sesión", use_container_width=True):
+        _logout_user(cookie_manager)
+        st.rerun()
 
 DATA_DIR = Path("data")
 
@@ -180,6 +403,18 @@ DECLARED_CAPACITY = 847
 
 TURNOS = ["Turno 1", "Turno 2"]
 MAX_LEVELS = 3
+
+# Zonas cuyas tarimas NO se remontan: solo admiten Nivel 1.
+SINGLE_LEVEL_ZONES = {"Walmart"}
+
+
+def max_level_for_zone(zone) -> int:
+    return 1 if zone in SINGLE_LEVEL_ZONES else MAX_LEVELS
+
+
+def zone_allows_stacking(zone) -> bool:
+    return max_level_for_zone(zone) > 1
+
 
 # Cada fila se modela desde el lado de acceso hacia el fondo.
 # depth = 1 es la posición más cercana al acceso.
@@ -866,6 +1101,10 @@ def slot_row(df, zone, position, level):
 
 
 def can_place_on_level(df, zone, position, level) -> bool:
+    # Walmart (y cualquier zona sin remontado) solo admite Nivel 1.
+    if int(level) > max_level_for_zone(zone):
+        return False
+
     current = slot_row(df, zone, position, level)
 
     if current.empty or current.iloc[0]["status"] != "Disponible":
@@ -1318,6 +1557,10 @@ def recommend_deepest_destination(
             .iloc[0]
         )
 
+    # Zonas sin remontado (Walmart): solo N1, nunca N2/N3.
+    if not zone_allows_stacking(zone):
+        return None
+
     # NIVEL 2: solo cuando N1 ya no tiene espacios libres.
     level2_valid = []
 
@@ -1450,13 +1693,18 @@ def row_level_status(
         and n2_free == 0
     )
 
+    if not zone_allows_stacking(zone):
+        # Walmart: N2/N3 no existen operativamente.
+        n2_free = 0
+
     return {
         "n1_free": n1_free,
         "n2_free": n2_free,
         "n1_full": n1_full,
         "n2_full": n2_full,
         "n3_allowed": (
-            n1_full
+            zone_allows_stacking(zone)
+            and n1_full
             and n2_full
         ),
     }
@@ -2043,6 +2291,10 @@ def next_slot_in_row(
     if not level1.empty:
         return level1.iloc[0]
 
+    # Zonas sin remontado (Walmart): solo N1, nunca N2/N3.
+    if not zone_allows_stacking(zone):
+        return None
+
     # Nivel 2
     level2_indices = []
 
@@ -2117,6 +2369,10 @@ def plan_batch_entry_across_rows(
 
     if quantity <= 0:
         return pd.DataFrame()
+
+    # Walmart: nunca sobrealmacenamiento en N3.
+    if not zone_allows_stacking(zone):
+        allow_level3 = False
 
     simulated = df.copy()
     planned = []
@@ -2542,6 +2798,28 @@ st.title("Almacén Digital — COONAPROSAL R.L.")
 st.success(
     "VERSIÓN ACTIVA: V8.1 — relocalización visual por tarima"
 )
+
+# Aviso: tarimas en niveles no permitidos (p. ej. Walmart en N2/N3).
+# No se borran ni se mueven; solo se informa para corregir manualmente.
+_level_violations = df[
+    (df["status"] == "Ocupada")
+    & (
+        df["level"].astype(int)
+        > df["zone"].map(max_level_for_zone)
+    )
+]
+
+if not _level_violations.empty:
+    st.warning(
+        f"Hay {len(_level_violations)} tarima(s) en niveles no permitidos "
+        "(zonas sin remontado, como Walmart, solo admiten Nivel 1). "
+        "No se modificaron; reubíquelas a Nivel 1: "
+        + "; ".join(
+            f'{r["zone"]} {r["position"]}-N{int(r["level"])} '
+            f'(SKU {r["sku"]}, lote {r["lot"]})'
+            for _, r in _level_violations.iterrows()
+        )
+    )
 st.caption(
     "Control visual de inventario, ubicación, remontado, lotes, indicadores y reacomodos PEPS. "
     "La profundidad 1 corresponde al lado de acceso de cada fila."
@@ -2998,13 +3276,77 @@ with m1:
         list(ZONES.keys()),
     )
 
-with m2:
-    search = st.text_input(
-        "Buscar SKU, lote o producto",
-        placeholder="Ej.: 0002",
-    ).strip()
-
 zone_df = df[df["zone"] == selected_zone].copy()
+
+with m2:
+    search_type = st.selectbox(
+        "Buscar por",
+        ["SKU", "Lote", "Producto", "Texto libre"],
+        key="map_search_type",
+    )
+
+    occupied_zone_df = zone_df[zone_df["status"] == "Ocupada"]
+
+    if search_type == "Texto libre":
+        search = st.text_input(
+            "Buscar SKU, lote o producto",
+            placeholder="Escriba SKU, lote o producto",
+            key="map_search_text",
+        ).strip()
+    elif search_type == "Lote":
+        available_lots = sorted(
+            lot_value
+            for lot_value in (
+                occupied_zone_df["lot"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .unique()
+            )
+            if lot_value
+        )
+        search = st.selectbox(
+            "Lote ingresado en esta zona",
+            options=available_lots,
+            index=None,
+            placeholder="Escriba o seleccione un lote",
+            key="map_search_lot",
+        )
+        search = (search or "").strip()
+    elif search_type == "Producto":
+        available_products = sorted(
+            product_value
+            for product_value in (
+                occupied_zone_df["product"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .unique()
+            )
+            if product_value
+        )
+        search = st.selectbox(
+            "Producto ingresado en esta zona",
+            options=available_products,
+            index=None,
+            placeholder="Escriba o seleccione un producto",
+            key="map_search_product",
+        )
+        search = (search or "").strip()
+    else:
+        catalog_products = catalog.drop_duplicates(
+            "sku",
+            keep="first",
+        ).set_index("sku")["product"].to_dict()
+        search = st.selectbox(
+            "Buscar SKU",
+            options=list(catalog_products),
+            index=None,
+            format_func=lambda value: f"{value} - {catalog_products[value]}",
+            placeholder="Escriba o seleccione un SKU",
+            key="map_search_sku",
+        )
+        search = (search or "").strip()
 
 available_rows_view = sorted(
     zone_df["row_id"].unique()
@@ -3229,11 +3571,30 @@ with tab_in:
         key="assign_mode",
     )
 
-    sku = st.text_input(
-        "Código SKU",
-        placeholder="Ej.: 0002",
-        key="entry_sku",
-    ).strip().upper()
+    new_sku_mode = st.checkbox(
+        "El SKU no está en el catálogo",
+        key="entry_new_sku_mode",
+    )
+
+    if new_sku_mode:
+        sku = st.text_input(
+            "Código SKU nuevo",
+            key="entry_new_sku",
+        ).strip().upper()
+    else:
+        catalog_products = catalog.drop_duplicates(
+            "sku",
+            keep="first",
+        ).set_index("sku")["product"].to_dict()
+        sku = st.selectbox(
+            "Código SKU",
+            options=list(catalog_products),
+            index=None,
+            format_func=lambda value: f"{value} - {catalog_products[value]}",
+            placeholder="Escriba o seleccione un SKU",
+            key="entry_sku",
+        )
+        sku = (sku or "").strip().upper()
 
     product_info = lookup_product(
         catalog,
@@ -3272,9 +3633,185 @@ with tab_in:
                 "Puede ingresar el nombre para guardarlo."
             )
 
-    manual_row = None
-    manual_position = None
-    manual_level = None
+    manual_selected_slots = []
+
+    # Cantidad y N3 van fuera del formulario para que la selección
+    # manual de ubicaciones se actualice al momento.
+    pallet_qty = st.number_input(
+        "Cantidad de tarimas que ingresan",
+        min_value=1,
+        max_value=200,
+        value=1,
+        step=1,
+        key="entry_pallet_qty",
+    )
+
+    zone_in_stackable = zone_allows_stacking(zone_in)
+
+    allow_level3 = st.checkbox(
+        "Autorizar sobrealmacenamiento en Nivel 3",
+        value=False,
+        disabled=not zone_in_stackable,
+        key="entry_allow_level3",
+        help=(
+            "Nivel 3 no forma parte de la asignación normal. "
+            "Solo se utilizará si ya no quedan ubicaciones N1/N2 "
+            "compatibles en la zona."
+            if zone_in_stackable
+            else (
+                f"{zone_in} no admite remontado: sus tarimas "
+                "solo se ubican en Nivel 1."
+            )
+        ),
+    )
+
+    if not zone_in_stackable:
+        allow_level3 = False
+        st.caption(
+            f"{zone_in}: solo Nivel 1. Sus tarimas no se remontan "
+            "(no se usan N2 ni N3)."
+        )
+
+    if assign_mode == "Manual":
+        st.markdown("##### Elegir ubicaciones")
+
+        manual_rows = (
+            compatible_rows_for_sku(
+                df,
+                zone_in,
+                sku,
+            )
+            if sku
+            else sorted(
+                df[df["zone"] == zone_in]["row_id"].unique(),
+                key=row_sort_key,
+            )
+        )
+
+        # Sugerencia automática para pre-marcar filas y posiciones.
+        suggestion = (
+            plan_batch_entry_across_rows(
+                df,
+                zone_in,
+                sku,
+                int(pallet_qty),
+                allow_level3=allow_level3,
+            )
+            if sku
+            else pd.DataFrame()
+        )
+
+        suggested_slot_ids = []
+
+        for _, s in suggestion.iterrows():
+            match = df[
+                (df["zone"] == zone_in)
+                & (df["row_id"] == s["Fila"])
+                & (df["position"] == s["Posición"])
+                & (df["level"] == int(s["Nivel"]))
+            ]
+
+            if not match.empty:
+                suggested_slot_ids.append(int(match.index[0]))
+
+        suggested_rows = [
+            r
+            for r in manual_rows
+            if not suggestion.empty
+            and r in suggestion["Fila"].tolist()
+        ]
+
+        # Las claves incluyen el contexto: si cambia zona, SKU, cantidad
+        # o N3, la selección vuelve a la sugerencia automática.
+        selection_context = (
+            f"{zone_in}|{sku}|{int(pallet_qty)}|{bool(allow_level3)}"
+        )
+
+        selected_rows = st.multiselect(
+            "Filas",
+            manual_rows,
+            default=suggested_rows,
+            key=f"manual_rows_in|{selection_context}",
+            help="Solo se muestran filas vacías o que ya tienen este SKU.",
+        )
+
+        allowed_levels = (
+            [1, 2, 3] if allow_level3 else [1, 2]
+        )
+        allowed_levels = [
+            level
+            for level in allowed_levels
+            if level <= max_level_for_zone(zone_in)
+        ]
+
+        candidate_slots = df[
+            (df["zone"] == zone_in)
+            & (df["row_id"].isin(selected_rows))
+            & (df["level"].isin(allowed_levels))
+            & (df["status"] == "Disponible")
+        ]
+
+        slot_options = [
+            int(idx)
+            for idx, r in candidate_slots.iterrows()
+            if can_place_on_level(
+                df,
+                zone_in,
+                r["position"],
+                int(r["level"]),
+            )
+        ]
+
+        # Orden: fila, nivel y del fondo hacia el acceso (PEPS).
+        slot_options.sort(
+            key=lambda idx: (
+                row_sort_key(df.at[idx, "row_id"]),
+                int(df.at[idx, "level"]),
+                -int(df.at[idx, "depth"]),
+            )
+        )
+
+        if selected_rows and not slot_options:
+            if not zone_in_stackable:
+                st.warning(
+                    f"Las filas seleccionadas de {zone_in} no tienen "
+                    "espacio en Nivel 1. Esta zona no admite remontado "
+                    "(N2/N3); elija otras filas o libere espacio."
+                )
+            else:
+                st.warning(
+                    "Las filas seleccionadas no tienen ubicaciones "
+                    "disponibles."
+                )
+
+        manual_selected_slots = st.multiselect(
+            f"Posiciones (marque {int(pallet_qty)})",
+            slot_options,
+            default=[
+                idx
+                for idx in suggested_slot_ids
+                if idx in slot_options
+            ],
+            max_selections=int(pallet_qty),
+            format_func=lambda idx: (
+                f'{df.at[idx, "position"]} · N{int(df.at[idx, "level"])}'
+                f' · {df.at[idx, "row_id"]}'
+            ),
+            key=(
+                f"manual_slots_in|{selection_context}"
+                f"|{'-'.join(selected_rows)}"
+            ),
+            help=(
+                "Viene marcada la sugerencia automática; puede quitar o "
+                "cambiar posiciones. Todas las tarimas son del mismo lote, "
+                "así que no importa cuál va en cada posición."
+            ),
+        )
+
+        st.caption(
+            f"Seleccionadas {len(manual_selected_slots)} de "
+            f"{int(pallet_qty)} ubicación(es)."
+        )
 
     with st.form(
         "entrada_multiple_form",
@@ -3302,104 +3839,6 @@ with tab_in:
             min_value=0,
             step=1,
         )
-
-        pallet_qty = st.number_input(
-            "Cantidad de tarimas que ingresan",
-            min_value=1,
-            max_value=200,
-            value=1,
-            step=1,
-        )
-
-        allow_level3 = st.checkbox(
-            "Autorizar sobrealmacenamiento en Nivel 3",
-            value=False,
-            help=(
-                "Nivel 3 no forma parte de la asignación normal. "
-                "Solo se utilizará si ya no quedan ubicaciones N1/N2 "
-                "compatibles en la zona."
-            ),
-        )
-
-        if assign_mode == "Manual":
-            manual_rows = (
-                compatible_rows_for_sku(
-                    df,
-                    zone_in,
-                    sku,
-                )
-                if sku
-                else sorted(
-                    df[df["zone"] == zone_in]["row_id"].unique(),
-                    key=row_sort_key,
-                )
-            )
-
-            manual_row = st.selectbox(
-                "Fila",
-                manual_rows,
-                key="manual_row_in",
-            )
-
-            row_slots = df[
-                (df["zone"] == zone_in)
-                & (df["row_id"] == manual_row)
-            ]
-
-            positions = (
-                row_slots[
-                    [
-                        "position",
-                        "depth",
-                    ]
-                ]
-                .drop_duplicates()
-                .sort_values("depth")
-            )
-
-            manual_position = st.selectbox(
-                "Posición",
-                positions["position"].tolist(),
-                key="manual_position_in",
-            )
-
-            normal_levels = [
-                level
-                for level in [1, 2]
-                if can_place_on_level(
-                    df,
-                    zone_in,
-                    manual_position,
-                    level,
-                )
-            ]
-
-            if normal_levels:
-                valid_levels = normal_levels
-            elif allow_level3 and can_place_on_level(
-                df,
-                zone_in,
-                manual_position,
-                3,
-            ):
-                valid_levels = [3]
-            else:
-                valid_levels = []
-
-            if valid_levels:
-                manual_level = st.selectbox(
-                    "Nivel",
-                    valid_levels,
-                    key="manual_level_in",
-                )
-            else:
-                st.warning(
-                    "La posición seleccionada no tiene un nivel permitido disponible."
-                )
-
-            st.caption(
-                "En modo Manual se registra una tarima por operación."
-            )
 
         generate_plan = st.form_submit_button(
             "Generar propuesta de ubicaciones",
@@ -3432,11 +3871,12 @@ with tab_in:
 
         if (
             assign_mode == "Manual"
-            and int(pallet_qty) != 1
+            and len(manual_selected_slots) != int(pallet_qty)
         ):
             errors.append(
-                "En modo Manual la cantidad debe ser 1. "
-                "Use PEPS automático por filas para ingresos múltiples."
+                f"Seleccionó {len(manual_selected_slots)} de "
+                f"{int(pallet_qty)} ubicación(es). En modo Manual debe "
+                "marcar una posición por cada tarima."
             )
 
         if errors:
@@ -3466,50 +3906,64 @@ with tab_in:
                 )
 
             else:
-                if (
-                    manual_row is None
-                    or manual_level is None
-                    or not row_accepts_sku(
-                        df,
-                        zone_in,
-                        manual_row,
-                        sku,
-                    )
-                ):
-                    proposal = pd.DataFrame()
-                else:
-                    manual_slot = df[
-                        (df["zone"] == zone_in)
-                        & (df["row_id"] == manual_row)
-                        & (df["position"] == manual_position)
-                        & (df["level"] == int(manual_level))
-                    ].iloc[0]
+                manual_records = []
 
-                    proposal = pd.DataFrame(
-                        [
-                            {
-                                "Tarima": 1,
-                                "Zona": zone_in,
-                                "Fila": manual_row,
-                                "Posición": manual_position,
-                                "Profundidad": int(manual_slot["depth"]),
-                                "Nivel": int(manual_level),
-                                "Tipo de ubicación": (
-                                    "Sobrealmacenamiento N3"
-                                    if int(manual_level) == 3
-                                    else "Manual"
-                                ),
-                            }
-                        ]
+                for idx in manual_selected_slots:
+                    slot = df.loc[idx]
+
+                    # Revalida: zona correcta, fila compatible con el SKU
+                    # y nivel permitido (Walmart solo N1).
+                    if (
+                        slot["zone"] != zone_in
+                        or not row_accepts_sku(
+                            df,
+                            zone_in,
+                            slot["row_id"],
+                            sku,
+                        )
+                        or not can_place_on_level(
+                            df,
+                            zone_in,
+                            slot["position"],
+                            int(slot["level"]),
+                        )
+                    ):
+                        continue
+
+                    manual_records.append(
+                        {
+                            "Tarima": len(manual_records) + 1,
+                            "Zona": zone_in,
+                            "Fila": slot["row_id"],
+                            "Posición": slot["position"],
+                            "Profundidad": int(slot["depth"]),
+                            "Nivel": int(slot["level"]),
+                            "Tipo de ubicación": (
+                                "Sobrealmacenamiento N3"
+                                if int(slot["level"]) == 3
+                                else "Manual"
+                            ),
+                        }
                     )
+
+                proposal = pd.DataFrame(manual_records)
 
             if len(proposal) != int(pallet_qty):
-                st.error(
-                    f"Se encontraron {len(proposal)} ubicación(es) válidas "
-                    f"para un ingreso de {int(pallet_qty)} tarima(s). "
-                    "Si la capacidad N1/N2 está agotada, puede autorizar N3 "
-                    "solo si realmente existe sobrealmacenamiento."
-                )
+                if not zone_allows_stacking(zone_in):
+                    st.error(
+                        f"{zone_in} no tiene espacio disponible en Nivel 1: "
+                        f"se encontraron {len(proposal)} de "
+                        f"{int(pallet_qty)} ubicación(es) necesarias. "
+                        "Esta zona no admite remontado (N2/N3), así que "
+                        "debe liberar espacio o usar otra zona."
+                    )
+                else:
+                    st.error(
+                        f"Se encontraron {len(proposal)} ubicación(es) válidas "
+                        f"para un ingreso de {int(pallet_qty)} tarima(s). "
+                        "Si la capacidad N1/N2 está agotada, puede autorizar N3 "
+                        "solo si realmente existe sobrealmacenamiento."
+                    )
 
                 st.session_state.pop(
                     "entry_batch_plan",
@@ -3543,7 +3997,12 @@ with tab_in:
         )
 
         st.markdown(
-            "#### Propuesta automática de ubicaciones"
+            "#### Propuesta de ubicaciones"
+            + (
+                " (manual)"
+                if batch_plan["mode"] == "Manual"
+                else " (automática)"
+            )
         )
 
         st.write(
@@ -3586,6 +4045,8 @@ with tab_in:
         else:
             st.success(
                 "La propuesta utiliza únicamente N1 y N2."
+                if zone_allows_stacking(batch_plan["zone"])
+                else "La propuesta utiliza únicamente Nivel 1."
             )
 
         confirm_batch_entry = st.checkbox(
@@ -3618,6 +4079,15 @@ with tab_in:
                     idx = slot.index[0]
 
                     if df.at[idx, "status"] != "Disponible":
+                        continue
+
+                    # Revalida al registrar (p. ej. Walmart solo N1).
+                    if not can_place_on_level(
+                        df,
+                        planned["Zona"],
+                        planned["Posición"],
+                        int(planned["Nivel"]),
+                    ):
                         continue
 
                     occupy_slot(
@@ -4292,11 +4762,50 @@ with tab_relocate:
             )
 
         else:
+            relocation_stackable = zone_allows_stacking(
+                relocation_zone
+            )
+
             allow_relocation_n3 = st.checkbox(
                 "Autorizar Nivel 3 por sobrealmacenamiento",
                 value=False,
                 key="relocation_allow_n3",
+                disabled=not relocation_stackable,
+                help=(
+                    None
+                    if relocation_stackable
+                    else (
+                        f"{relocation_zone} no admite remontado: "
+                        "solo Nivel 1."
+                    )
+                ),
             )
+
+            if not relocation_stackable:
+                allow_relocation_n3 = False
+
+                dest_n1_free = int(
+                    (
+                        (df["zone"] == relocation_zone)
+                        & (df["row_id"] == destination_row_id)
+                        & (df["level"] == 1)
+                        & (df["status"] == "Disponible")
+                    ).sum()
+                )
+
+                if dest_n1_free == 0:
+                    st.warning(
+                        f"La fila destino {destination_row_id} de "
+                        f"{relocation_zone} no tiene espacio en Nivel 1. "
+                        "Esta zona no admite remontado (N2/N3); "
+                        "elija otra fila o libere espacio."
+                    )
+                else:
+                    st.caption(
+                        f"{relocation_zone}: solo Nivel 1 · "
+                        f"{dest_n1_free} espacio(s) libre(s) en la "
+                        "fila destino."
+                    )
 
             direct_origin = direct_accessible_pallets_in_row(
                 df,

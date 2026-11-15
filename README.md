@@ -33,14 +33,19 @@ streamlit run app.py
 ## Acceso y roles
 
 La aplicación obtiene las cuentas desde `st.secrets` y valida las contraseñas
-con bcrypt. La estructura esperada para `.streamlit/secrets.toml` es:
+con bcrypt. También requiere una clave aleatoria de al menos 32 bytes para
+firmar la cookie de sesión de 8 horas. Genérela con
+`python -c "import secrets; print(secrets.token_hex(32))"` y use el resultado
+como `cookie_key`. La estructura esperada para `.streamlit/secrets.toml` es:
 
 ```toml
-[users.editor]
+cookie_key = "<CLAVE_ALEATORIA_GENERADA>"
+
+[usuarios.editor]
 rol = "editor"
 password_hash = "<HASH_BCRYPT_DEL_EDITOR>"
 
-[users.visualizador]
+[usuarios.visualizador]
 rol = "visualizador"
 password_hash = "<HASH_BCRYPT_DEL_VISUALIZADOR>"
 ```
