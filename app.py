@@ -493,9 +493,107 @@ STATE_COLUMNS = [
     "production_date",
     "entry_shift",
     "bundles",
+    "lot_detail",
     "status",
     "last_update",
 ]
+
+# ------------------------------------------------------------
+# TARIMAS MIXTAS (varios lotes en una sola tarima)
+# ------------------------------------------------------------
+# lot_detail guarda el desglose "lote|fecha|bultos;lote|fecha|bultos".
+# En tarimas de un solo lote queda vacío.
+# Para tarimas mixtas, las columnas resumen quedan así:
+#   lot             = "22-10 + 23-10"   (búsquedas y vistas)
+#   production_date = fecha MÁS ANTIGUA (PEPS: sale por su lote más viejo)
+#   bundles         = total de bultos de la tarima
+LOT_SEPARATOR = " + "
+LOT_FORBIDDEN_CHARS = ("|", ";", "+")
+
+
+def encode_lot_detail(parts) -> str:
+    if len(parts) < 2:
+        return ""
+
+    return ";".join(
+        f'{p["lot"]}|{p["production_date"]}|{int(p["bundles"])}'
+        for p in parts
+    )
+
+
+def decode_lot_detail(text) -> list:
+    parts = []
+
+    for chunk in str(text or "").split(";"):
+        pieces = chunk.split("|")
+
+        if len(pieces) != 3 or not pieces[0].strip():
+            continue
+
+        try:
+            qty = int(float(pieces[2]))
+        except ValueError:
+            qty = 0
+
+        parts.append(
+            {
+                "lot": pieces[0].strip(),
+                "production_date": pieces[1].strip(),
+                "bundles": qty,
+            }
+        )
+
+    return parts
+
+
+def pallet_lot_parts(row) -> list:
+    """Lista de lotes de una tarima (1 elemento si no es mixta)."""
+    parts = decode_lot_detail(row.get("lot_detail", ""))
+
+    if parts:
+        return parts
+
+    if str(row.get("lot", "")).strip():
+        return [
+            {
+                "lot": str(row["lot"]).strip(),
+                "production_date": str(row.get("production_date", "")),
+                "bundles": int(row.get("bundles", 0) or 0),
+            }
+        ]
+
+    return []
+
+
+def summarize_lot_parts(parts):
+    """(lote resumen, fecha más antigua, bultos totales)."""
+    lot_text = LOT_SEPARATOR.join(p["lot"] for p in parts)
+    dates = sorted(
+        p["production_date"] for p in parts if p["production_date"]
+    )
+    total = sum(int(p["bundles"]) for p in parts)
+
+    return lot_text, (dates[0] if dates else ""), total
+
+
+def lot_detail_label(row) -> str:
+    """Texto del lote para mostrar: incluye bultos si la tarima es mixta."""
+    parts = decode_lot_detail(row.get("lot_detail", ""))
+
+    if not parts:
+        return str(row.get("lot", ""))
+
+    return "Mixta: " + LOT_SEPARATOR.join(
+        f'{p["lot"]} ({p["bundles"]} b)' for p in parts
+    )
+
+
+def split_lots(lot_text) -> list:
+    return [
+        piece.strip()
+        for piece in str(lot_text or "").split("+")
+        if piece.strip()
+    ]
 
 MOVE_COLUMNS = [
     "timestamp",
@@ -512,6 +610,7 @@ MOVE_COLUMNS = [
     "lot",
     "production_date",
     "bundles",
+    "lot_detail",
     "notes",
 ]
 
@@ -698,10 +797,21 @@ def current_inventory_summary(
             product_state=("product", "first"),
             tarimas=("level", "count"),
             bultos=("bundles", "sum"),
-            lotes=("lot", lambda x: x[x.astype(str) != ""].nunique()),
             posiciones=("position", "nunique"),
         )
         .reset_index()
+    )
+
+    # Lotes distintos por SKU, contando cada lote de las tarimas mixtas.
+    lots_by_sku = {}
+
+    for _, r in occupied.iterrows():
+        lots_by_sku.setdefault(r["sku"], set()).update(
+            p["lot"] for p in pallet_lot_parts(r)
+        )
+
+    summary["lotes"] = summary["sku"].map(
+        lambda s: len(lots_by_sku.get(s, set()))
     )
 
     product_map = (
@@ -938,6 +1048,7 @@ def create_empty_state() -> pd.DataFrame:
                             "production_date": "",
                             "entry_shift": "",
                             "bundles": 0,
+                            "lot_detail": "",
                             "status": "Disponible",
                             "last_update": "",
                         }
@@ -992,6 +1103,7 @@ def load_state() -> pd.DataFrame:
         "production_date": "",
         "entry_shift": "",
         "bundles": 0,
+        "lot_detail": "",
         "status": "Disponible",
         "last_update": "",
     }
@@ -1044,6 +1156,7 @@ def log_move(**kwargs) -> None:
         "lot": kwargs.get("lot", ""),
         "production_date": kwargs.get("production_date", ""),
         "bundles": kwargs.get("bundles", 0),
+        "lot_detail": kwargs.get("lot_detail", ""),
         "notes": kwargs.get("notes", ""),
     }
 
@@ -1060,6 +1173,7 @@ def occupy_slot(
     production_date: str,
     entry_shift: str,
     bundles: int,
+    lot_detail: str = "",
 ) -> None:
     require_editor()
     df.at[idx, "sku"] = sku.strip()
@@ -1068,6 +1182,7 @@ def occupy_slot(
     df.at[idx, "production_date"] = production_date
     df.at[idx, "entry_shift"] = entry_shift
     df.at[idx, "bundles"] = int(bundles)
+    df.at[idx, "lot_detail"] = str(lot_detail or "")
     df.at[idx, "status"] = "Ocupada"
     df.at[idx, "last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1080,6 +1195,7 @@ def clear_slot(df: pd.DataFrame, idx: int) -> None:
         "lot",
         "production_date",
         "entry_shift",
+        "lot_detail",
         "last_update",
     ]:
         df.at[idx, col] = ""
@@ -1883,6 +1999,7 @@ def history_excel_bytes(
             "lot": "Lote",
             "production_date": "Fecha producción",
             "bundles": "Bultos",
+            "lot_detail": "Detalle tarima mixta",
             "notes": "Observaciones",
         }
 
@@ -2555,7 +2672,7 @@ def pallet_drag_label(
     """
     return (
         f"{row['position']}-N{row['level']} · "
-        f"SKU {row['sku']} · Lote {row['lot']} · "
+        f"SKU {row['sku']} · Lote {lot_detail_label(row)} · "
         f"Fecha {row['production_date'] or 's/f'}"
     )
 
@@ -2652,6 +2769,9 @@ def stack_card(position_df, search, palette, oldest_lot):
 
         sku = row["sku"] if row["sku"] else "LIBRE"
         lot = row["lot"] if row["lot"] else "—"
+
+        if str(row.get("lot_detail", "")).strip():
+            lot = f"{lot} (mixta)"
 
         badge = ""
 
@@ -3294,16 +3414,13 @@ with m2:
             key="map_search_text",
         ).strip()
     elif search_type == "Lote":
+        # Las tarimas mixtas aportan cada uno de sus lotes.
         available_lots = sorted(
-            lot_value
-            for lot_value in (
-                occupied_zone_df["lot"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .unique()
-            )
-            if lot_value
+            {
+                lot_value
+                for lot_text in occupied_zone_df["lot"].fillna("").astype(str)
+                for lot_value in split_lots(lot_text)
+            }
         )
         search = st.selectbox(
             "Lote ingresado en esta zona",
@@ -3813,6 +3930,22 @@ with tab_in:
             f"{int(pallet_qty)} ubicación(es)."
         )
 
+    mixed_pallet = st.checkbox(
+        "Tarima mixta (bultos de varios lotes en una misma tarima)",
+        key="entry_mixed_pallet",
+        help=(
+            "Marque esta opción si la tarima se completó con bultos de "
+            "otro lote. Si ingresan varias tarimas, todas llevan la "
+            "misma combinación de lotes; registre aparte las que sean "
+            "diferentes."
+        ),
+    )
+
+    lot = ""
+    prod_date = date.today()
+    bundles = 0
+    mixed_lots_df = None
+
     with st.form(
         "entrada_multiple_form",
         clear_on_submit=False,
@@ -3824,21 +3957,58 @@ with tab_in:
             placeholder="Nombre del producto",
         )
 
-        lot = st.text_input(
-            "Lote",
-            placeholder="22-10",
-        )
+        if mixed_pallet:
+            st.caption(
+                "Indique cada lote que forma la tarima y cuántos bultos "
+                "lleva de cada uno. Agregue filas si son más de dos lotes."
+            )
 
-        prod_date = st.date_input(
-            "Fecha de producción",
-            value=date.today(),
-        )
+            mixed_lots_df = st.data_editor(
+                pd.DataFrame(
+                    {
+                        "Lote": ["", ""],
+                        "Fecha de producción": [date.today(), date.today()],
+                        "Bultos": [0, 0],
+                    }
+                ),
+                num_rows="dynamic",
+                hide_index=True,
+                use_container_width=True,
+                key="entry_mixed_lots_editor",
+                column_config={
+                    "Lote": st.column_config.TextColumn(
+                        "Lote",
+                        required=True,
+                    ),
+                    "Fecha de producción": st.column_config.DateColumn(
+                        "Fecha de producción",
+                        required=True,
+                        format="YYYY-MM-DD",
+                    ),
+                    "Bultos": st.column_config.NumberColumn(
+                        "Bultos",
+                        min_value=0,
+                        step=1,
+                        required=True,
+                    ),
+                },
+            )
+        else:
+            lot = st.text_input(
+                "Lote",
+                placeholder="22-10",
+            )
 
-        bundles = st.number_input(
-            "Bultos por tarima",
-            min_value=0,
-            step=1,
-        )
+            prod_date = st.date_input(
+                "Fecha de producción",
+                value=date.today(),
+            )
+
+            bundles = st.number_input(
+                "Bultos por tarima",
+                min_value=0,
+                step=1,
+            )
 
         generate_plan = st.form_submit_button(
             "Generar propuesta de ubicaciones",
@@ -3859,10 +4029,95 @@ with tab_in:
                 "Debe indicar SKU."
             )
 
-        if not lot.strip():
-            errors.append(
-                "Debe indicar lote."
-            )
+        # Composición de lotes de la tarima (1 lote o mixta).
+        lot_parts = []
+
+        if mixed_pallet:
+            for _, part in (
+                mixed_lots_df
+                if mixed_lots_df is not None
+                else pd.DataFrame()
+            ).iterrows():
+                part_lot = str(part.get("Lote") or "").strip()
+                part_bundles = pd.to_numeric(
+                    part.get("Bultos"),
+                    errors="coerce",
+                )
+                part_date = part.get("Fecha de producción")
+
+                if not part_lot and (
+                    pd.isna(part_bundles) or part_bundles == 0
+                ):
+                    continue  # fila vacía
+
+                if not part_lot:
+                    errors.append("Hay una fila de lote sin nombre.")
+                    continue
+
+                if any(ch in part_lot for ch in LOT_FORBIDDEN_CHARS):
+                    errors.append(
+                        f"El lote «{part_lot}» no puede contener "
+                        "los caracteres | ; +"
+                    )
+                    continue
+
+                if pd.isna(part_bundles) or int(part_bundles) <= 0:
+                    errors.append(
+                        f"Indique los bultos del lote {part_lot}."
+                    )
+                    continue
+
+                if part_date is None or pd.isna(part_date):
+                    errors.append(
+                        f"Indique la fecha de producción del lote {part_lot}."
+                    )
+                    continue
+
+                lot_parts.append(
+                    {
+                        "lot": part_lot,
+                        "production_date": pd.Timestamp(
+                            part_date
+                        ).date().isoformat(),
+                        "bundles": int(part_bundles),
+                    }
+                )
+
+            part_names = [p["lot"] for p in lot_parts]
+
+            if len(set(part_names)) != len(part_names):
+                errors.append(
+                    "Hay lotes repetidos en la tarima mixta; "
+                    "sume sus bultos en una sola fila."
+                )
+
+            if len(lot_parts) < 2:
+                errors.append(
+                    "Una tarima mixta debe tener al menos dos lotes. "
+                    "Si es un solo lote, desmarque «Tarima mixta»."
+                )
+        else:
+            if not lot.strip():
+                errors.append(
+                    "Debe indicar lote."
+                )
+            elif any(ch in lot for ch in LOT_FORBIDDEN_CHARS):
+                errors.append(
+                    "El lote no puede contener los caracteres | ; +"
+                )
+
+            lot_parts = [
+                {
+                    "lot": lot.strip(),
+                    "production_date": prod_date.isoformat(),
+                    "bundles": int(bundles),
+                }
+            ]
+
+        entry_lot, entry_date, entry_bundles = summarize_lot_parts(
+            lot_parts
+        )
+        entry_lot_detail = encode_lot_detail(lot_parts)
 
         if not final_product:
             errors.append(
@@ -3979,9 +4234,10 @@ with tab_in:
                     "zone": zone_in,
                     "sku": sku,
                     "product": final_product,
-                    "lot": lot.strip(),
-                    "production_date": prod_date.isoformat(),
-                    "bundles": int(bundles),
+                    "lot": entry_lot,
+                    "production_date": entry_date,
+                    "bundles": int(entry_bundles),
+                    "lot_detail": entry_lot_detail,
                     "quantity": int(pallet_qty),
                     "mode": assign_mode,
                     "allow_level3": bool(allow_level3),
@@ -4010,6 +4266,22 @@ with tab_in:
             f"SKU **{batch_plan['sku']}** · "
             f"Lote **{batch_plan['lot']}**"
         )
+
+        plan_parts = decode_lot_detail(
+            batch_plan.get("lot_detail", "")
+        )
+
+        if plan_parts:
+            st.info(
+                f"Tarima mixta · {batch_plan['bundles']} bultos por tarima: "
+                + LOT_SEPARATOR.join(
+                    f'lote {p["lot"]} ({p["production_date"]}): '
+                    f'{p["bundles"]} b'
+                    for p in plan_parts
+                )
+                + ". Para PEPS cuenta la fecha más antigua "
+                f"({batch_plan['production_date']})."
+            )
 
         st.dataframe(
             proposal_df,
@@ -4099,6 +4371,7 @@ with tab_in:
                         batch_plan["production_date"],
                         batch_plan["turn"],
                         batch_plan["bundles"],
+                        batch_plan.get("lot_detail", ""),
                     )
 
                     log_move(
@@ -4118,8 +4391,14 @@ with tab_in:
                         lot=batch_plan["lot"],
                         production_date=batch_plan["production_date"],
                         bundles=batch_plan["bundles"],
+                        lot_detail=batch_plan.get("lot_detail", ""),
                         notes=(
-                            f"Ingreso múltiple de {batch_plan['quantity']} tarima(s). "
+                            (
+                                "Tarima mixta. "
+                                if batch_plan.get("lot_detail")
+                                else ""
+                            )
+                            + f"Ingreso múltiple de {batch_plan['quantity']} tarima(s). "
                             f"Tarima {planned['Tarima']} de {batch_plan['quantity']}. "
                             f"{planned['Tipo de ubicación']}."
                         ),
@@ -4392,7 +4671,7 @@ with tab_out:
             ):
                 label = (
                     f'{row["position"]}-N{row["level"]} | '
-                    f'Lote {row["lot"]} | '
+                    f'Lote {lot_detail_label(row)} | '
                     f'Fecha {row["production_date"] or "Sin fecha"} | '
                     f'{row["zone"]} / {row["row_id"]} | '
                     f'Bloqueos {int(row["bloqueos_totales"])}'
@@ -4628,6 +4907,7 @@ with tab_out:
                         bundles=(
                             row["bundles"]
                         ),
+                        lot_detail=row.get("lot_detail", ""),
                         notes=(
                             f"Pedido múltiple de {int(requested_qty)} tarima(s). "
                             f"Bloqueos identificados antes del despacho: "
@@ -5099,6 +5379,7 @@ with tab_relocate:
                                         int(
                                             row["bundles"]
                                         ),
+                                        row.get("lot_detail", ""),
                                     )
 
                                     clear_slot(
@@ -5130,6 +5411,7 @@ with tab_relocate:
                                             row["production_date"]
                                         ),
                                         bundles=row["bundles"],
+                                        lot_detail=row.get("lot_detail", ""),
                                         notes=(
                                             "Tarima movida mediante "
                                             "interfaz visual de arrastre."
@@ -5277,6 +5559,7 @@ with tab_relocate:
                                 int(
                                     row["bundles"]
                                 ),
+                                row.get("lot_detail", ""),
                             )
 
                             clear_slot(
@@ -5306,6 +5589,7 @@ with tab_relocate:
                                     row["production_date"]
                                 ),
                                 bundles=row["bundles"],
+                                lot_detail=row.get("lot_detail", ""),
                                 notes=(
                                     "Tarima seleccionada visualmente "
                                     "para relocalización."
@@ -5509,6 +5793,15 @@ if query:
             axis=1,
         )
 
+        result["detalle_lotes"] = result.apply(
+            lambda r: (
+                lot_detail_label(r)
+                if str(r.get("lot_detail", "")).strip()
+                else ""
+            ),
+            axis=1,
+        )
+
         st.dataframe(
             result[
                 [
@@ -5523,6 +5816,7 @@ if query:
                     "production_date",
                     "entry_shift",
                     "bundles",
+                    "detalle_lotes",
                     "tarimas_delante",
                     "tarimas_encima",
                 ]
