@@ -47,6 +47,7 @@ AUTH_COOKIE_PENDING_KEY = "auth_cookie_pending"
 COOKIE_MANAGER_READY_KEY = "auth_cookie_manager_ready"
 COOKIE_LOGOUT_PENDING_KEY = "auth_cookie_logout_pending"
 COOKIE_CONFIGURATION_KEY = "auth_cookie_configuration_error"
+COOKIE_RESTORE_BLOCKED_KEY = "auth_cookie_restore_blocked"
 logger = logging.getLogger(__name__)
 
 
@@ -250,12 +251,27 @@ def _confirm_login() -> None:
     _set_auth_cookie(username)
 
 
-def _logout_user(cookie_manager: stx.CookieManager) -> None:
+def _revoke_auth_cookie(cookie_manager: stx.CookieManager) -> None:
+    # Sobrescribe la cookie con un valor inválido (por si el borrado no
+    # llega al navegador) y además la borra.
+    cookie_manager.set(
+        AUTH_COOKIE_NAME,
+        "revocada",
+        key="auth_cookie_revoke",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
     if cookie_manager.get(AUTH_COOKIE_NAME) is not None:
         cookie_manager.delete(AUTH_COOKIE_NAME)
+
+
+def _logout_user(cookie_manager: stx.CookieManager) -> None:
+    _revoke_auth_cookie(cookie_manager)
     st.session_state.clear()
     st.session_state[COOKIE_MANAGER_READY_KEY] = True
     st.session_state[COOKIE_LOGOUT_PENDING_KEY] = True
+    # Tras cerrar sesión, esta pestaña nunca vuelve a entrar por cookie:
+    # hay que escribir la contraseña.
+    st.session_state[COOKIE_RESTORE_BLOCKED_KEY] = True
 
 
 def require_editor() -> None:
@@ -287,14 +303,27 @@ if st.session_state.get(AUTH_USER_KEY) is not None:
         _logout_user(cookie_manager)
 
 if st.session_state.get(COOKIE_LOGOUT_PENDING_KEY):
+    # Reintenta el borrado una vez; la restauración queda bloqueada
+    # igualmente por COOKIE_RESTORE_BLOCKED_KEY.
     if cookie_manager.get(AUTH_COOKIE_NAME) is not None:
-        cookie_manager.delete(AUTH_COOKIE_NAME)
-        st.stop()
+        cookie_manager.delete(AUTH_COOKIE_NAME, key="auth_cookie_delete_retry")
     st.session_state.pop(COOKIE_LOGOUT_PENDING_KEY, None)
 
+# La cookie solo restaura la sesión cuando NO hay un intento de login en
+# curso. Si el usuario ya escribió una contraseña (correcta o no), manda
+# el resultado de esa contraseña, nunca la cookie.
+login_attempt_in_progress = (
+    st.session_state.get("login_error") is not None
+    or st.session_state.get(PENDING_AUTH_USER_KEY) is not None
+)
+
 if (
-    st.session_state.get(AUTH_USER_KEY) is None
-    or st.session_state.get(AUTH_ROLE_KEY) not in VALID_ROLES
+    (
+        st.session_state.get(AUTH_USER_KEY) is None
+        or st.session_state.get(AUTH_ROLE_KEY) not in VALID_ROLES
+    )
+    and not st.session_state.get(COOKIE_RESTORE_BLOCKED_KEY)
+    and not login_attempt_in_progress
 ):
     auth_cookie = cookie_manager.get(AUTH_COOKIE_NAME)
     if auth_cookie is not None and not _restore_authentication_from_cookie(
